@@ -106,7 +106,10 @@ def clean_cell(value: object) -> str:
         value = int(value)
     if isinstance(value, int):
         return str(value)
-    return str(value).strip()
+    text = str(value)
+    text = re.sub(r"[\x00-\x1F\x7F]+", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
 
 def format_postal(value: object) -> str:
