@@ -78,9 +78,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--fit-mode",
-        choices=["wrap", "shrink"],
+        choices=["wrap", "shrink", "shrink-wrap"],
         default="shrink",
-        help="When text is too wide, either wrap lines or shrink the label font.",
+        help="When text is too wide, wrap, shrink, or shrink then wrap.",
+    )
+    parser.add_argument(
+        "--max-shrink",
+        type=float,
+        default=0.85,
+        help="Minimum scale allowed in shrink-wrap mode (e.g. 0.85).",
     )
     return parser.parse_args()
 
@@ -110,6 +116,12 @@ def clean_cell(value: object) -> str:
     text = re.sub(r"[\x00-\x1F\x7F]+", " ", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
+
+
+def value_at(values: List[object], idx: Optional[int], formatter=clean_cell) -> str:
+    if idx is None:
+        return ""
+    return formatter(values[idx])
 
 
 def format_postal(value: object) -> str:
@@ -187,20 +199,20 @@ def load_addresses(path: str, sheet_name: Optional[str]) -> List[List[tuple[str,
         if not any(row):
             continue
         values = list(row)
-        addressee = clean_cell(values[indices["addressee"]]) if indices["addressee"] is not None else ""
-        first_name = clean_cell(values[indices["first_name"]]) if indices["first_name"] is not None else ""
-        last_name = clean_cell(values[indices["last_name"]]) if indices["last_name"] is not None else ""
+        addressee = value_at(values, indices["addressee"])
+        first_name = value_at(values, indices["first_name"])
+        last_name = value_at(values, indices["last_name"])
         if not addressee:
             addressee = " ".join(part for part in [first_name, last_name] if part).strip()
 
         entry = {
             "addressee": addressee,
-            "address1": clean_cell(values[indices["address1"]]) if indices["address1"] is not None else "",
-            "address2": clean_cell(values[indices["address2"]]) if indices["address2"] is not None else "",
-            "city": clean_cell(values[indices["city"]]) if indices["city"] is not None else "",
-            "state": clean_cell(values[indices["state"]]) if indices["state"] is not None else "",
-            "postal": format_postal(values[indices["postal"]]) if indices["postal"] is not None else "",
-            "country": clean_cell(values[indices["country"]]) if indices["country"] is not None else "",
+            "address1": value_at(values, indices["address1"]),
+            "address2": value_at(values, indices["address2"]),
+            "city": value_at(values, indices["city"]),
+            "state": value_at(values, indices["state"]),
+            "postal": value_at(values, indices["postal"], format_postal),
+            "country": value_at(values, indices["country"]),
         }
 
         if not any(entry.values()):
@@ -395,6 +407,66 @@ def wrap_lines(
     return wrapped
 
 
+def measure_max_width(lines: Iterable[str], font_name: str, font_size: float) -> float:
+    from reportlab.pdfbase import pdfmetrics
+
+    return max(
+        (pdfmetrics.stringWidth(line, font_name, font_size) for line in lines),
+        default=0.0,
+    )
+
+
+def compute_scale(max_width: float, max_text_width: float) -> float:
+    if max_width <= 0 or max_width <= max_text_width:
+        return 1.0
+    return max_text_width / max_width
+
+
+def prepare_label_layout(
+    lines: List[tuple[str, str]],
+    max_text_width: float,
+    font_name: str,
+    font_size: float,
+    leading: float,
+    fit_mode: str,
+    max_shrink: float,
+) -> tuple[List[str], float, float]:
+    base_lines = [text for _, text in lines if text]
+    if not base_lines:
+        return [], font_size, leading
+
+    if fit_mode == "wrap":
+        return wrap_lines(lines, max_text_width, font_name, font_size), font_size, leading
+
+    max_line_width = measure_max_width(base_lines, font_name, font_size)
+    scale = compute_scale(max_line_width, max_text_width)
+
+    if fit_mode == "shrink":
+        return base_lines, font_size * scale, leading * scale
+
+    if scale < max_shrink:
+        return wrap_lines(lines, max_text_width, font_name, font_size), font_size, leading
+
+    return base_lines, font_size * scale, leading * scale
+
+
+def baseline_for_block(
+    origin_y: float,
+    label_height: float,
+    line_count: int,
+    leading: float,
+    font_name: str,
+    font_size: float,
+) -> float:
+    from reportlab.pdfbase import pdfmetrics
+
+    ascent = pdfmetrics.getAscent(font_name, font_size)
+    descent = pdfmetrics.getDescent(font_name, font_size)
+    line_height = ascent - descent
+    block_height = (line_count - 1) * leading + line_height
+    return origin_y + (label_height + block_height) / 2 - ascent
+
+
 def draw_labels(
     output_path: str,
     labels: List[List[tuple[str, str]]],
@@ -402,6 +474,7 @@ def draw_labels(
     font_size: float,
     leading: float,
     fit_mode: str,
+    max_shrink: float,
 ) -> None:
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfgen import canvas
@@ -437,28 +510,27 @@ def draw_labels(
         if not lines:
             continue
 
-        if fit_mode == "wrap":
-            rendered_lines = wrap_lines(lines, max_text_width, font_name, font_size)
-            label_font_size = font_size
-            label_leading = leading
-        else:
-            rendered_lines = [text for _, text in lines if text]
-            max_line_width = max(
-                (pdfmetrics.stringWidth(text, font_name, font_size) for text in rendered_lines),
-                default=0.0,
-            )
-            scale = 1.0
-            if max_line_width > max_text_width and max_line_width > 0:
-                scale = max_text_width / max_line_width
-            label_font_size = font_size * scale
-            label_leading = leading * scale
-
+        rendered_lines, label_font_size, label_leading = prepare_label_layout(
+            lines,
+            max_text_width,
+            font_name,
+            font_size,
+            leading,
+            fit_mode,
+            max_shrink,
+        )
         if not rendered_lines:
             continue
 
         pdf.setFont(font_name, label_font_size)
-        block_height = (len(rendered_lines) - 1) * label_leading + label_font_size
-        baseline_y = origin_y + (label_height + block_height) / 2 - label_font_size
+        baseline_y = baseline_for_block(
+            origin_y,
+            label_height,
+            len(rendered_lines),
+            label_leading,
+            font_name,
+            label_font_size,
+        )
 
         for line in rendered_lines:
             text_width = pdfmetrics.stringWidth(line, font_name, label_font_size)
@@ -472,6 +544,9 @@ def draw_labels(
 def main() -> None:
     args = parse_args()
 
+    if not 0 < args.max_shrink <= 1:
+        raise SystemExit("--max-shrink must be between 0 and 1.")
+
     if not os.path.isfile(args.input):
         raise SystemExit(f"Input file not found: {args.input}")
 
@@ -480,7 +555,15 @@ def main() -> None:
         raise SystemExit("No address rows found to render.")
 
     font_name = resolve_font(args.font, args.font_name)
-    draw_labels(args.output, labels, font_name, args.font_size, args.leading, args.fit_mode)
+    draw_labels(
+        args.output,
+        labels,
+        font_name,
+        args.font_size,
+        args.leading,
+        args.fit_mode,
+        args.max_shrink,
+    )
 
     print(f"Wrote {len(labels)} labels to {args.output}.")
 

@@ -1,5 +1,6 @@
 .DS_Store
 .venv/
+AGENTS.md
 Addresses*.xlsx
 label_outputs/
 labels*.pdf
