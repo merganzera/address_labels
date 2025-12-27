@@ -76,6 +76,12 @@ def parse_args() -> argparse.Namespace:
         default=14.0,
         help="Line spacing in points.",
     )
+    parser.add_argument(
+        "--fit-mode",
+        choices=["wrap", "shrink"],
+        default="shrink",
+        help="When text is too wide, either wrap lines or shrink the label font.",
+    )
     return parser.parse_args()
 
 
@@ -392,6 +398,7 @@ def draw_labels(
     font_name: str,
     font_size: float,
     leading: float,
+    fit_mode: str,
 ) -> None:
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfgen import canvas
@@ -412,12 +419,10 @@ def draw_labels(
     max_text_width = label_width - 2 * text_padding
 
     pdf = canvas.Canvas(output_path, pagesize=(page_width, page_height))
-    pdf.setFont(font_name, font_size)
 
     for index, lines in enumerate(labels):
         if index and index % labels_per_page == 0:
             pdf.showPage()
-            pdf.setFont(font_name, font_size)
 
         slot = index % labels_per_page
         row = slot // columns
@@ -429,18 +434,34 @@ def draw_labels(
         if not lines:
             continue
 
-        rendered_lines = wrap_lines(lines, max_text_width, font_name, font_size)
+        if fit_mode == "wrap":
+            rendered_lines = wrap_lines(lines, max_text_width, font_name, font_size)
+            label_font_size = font_size
+            label_leading = leading
+        else:
+            rendered_lines = [text for _, text in lines if text]
+            max_line_width = max(
+                (pdfmetrics.stringWidth(text, font_name, font_size) for text in rendered_lines),
+                default=0.0,
+            )
+            scale = 1.0
+            if max_line_width > max_text_width and max_line_width > 0:
+                scale = max_text_width / max_line_width
+            label_font_size = font_size * scale
+            label_leading = leading * scale
+
         if not rendered_lines:
             continue
 
-        block_height = (len(rendered_lines) - 1) * leading + font_size
-        baseline_y = origin_y + (label_height + block_height) / 2 - font_size
+        pdf.setFont(font_name, label_font_size)
+        block_height = (len(rendered_lines) - 1) * label_leading + label_font_size
+        baseline_y = origin_y + (label_height + block_height) / 2 - label_font_size
 
         for line in rendered_lines:
-            text_width = pdfmetrics.stringWidth(line, font_name, font_size)
+            text_width = pdfmetrics.stringWidth(line, font_name, label_font_size)
             text_x = origin_x + (label_width - text_width) / 2
             pdf.drawString(text_x, baseline_y, line)
-            baseline_y -= leading
+            baseline_y -= label_leading
 
     pdf.save()
 
@@ -456,7 +477,7 @@ def main() -> None:
         raise SystemExit("No address rows found to render.")
 
     font_name = resolve_font(args.font, args.font_name)
-    draw_labels(args.output, labels, font_name, args.font_size, args.leading)
+    draw_labels(args.output, labels, font_name, args.font_size, args.leading, args.fit_mode)
 
     print(f"Wrote {len(labels)} labels to {args.output}.")
 
